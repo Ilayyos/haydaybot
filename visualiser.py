@@ -1,102 +1,176 @@
+import logging
 import os
-import cv2
-import numpy as np
 import time
 import math
-from PIL import ImageGrab
+from typing import Dict, Iterable, List
+
+import cv2
+import numpy as np
+try:
+    from PIL import ImageGrab
+except Exception:  # pragma: no cover - optional dependency
+    ImageGrab = None
+try:
+    import mss
+except Exception:  # pragma: no cover - optional dependency
+    mss = None
 from status_console import StatusConsole
 from constants import (
-    VISUALISER_ENABLED, GREEN, OUTLINE_COLOR,
-    TARGET_COLOR, ACTION_COLOR, WARNING_COLOR, 
-    PATH_COLOR, CLICK_COLOR
+    VISUALISER_ENABLED,
+    GREEN,
+    OUTLINE_COLOR,
+    TARGET_COLOR,
+    ACTION_COLOR,
+    WARNING_COLOR,
+    PATH_COLOR,
+    CLICK_COLOR,
 )
 
+
+log = logging.getLogger(__name__)
+
 class Visualiser:
-    def __init__(self, display_offset=(0, 0)):
-        """
-        Initialize the visualiser with overlay window.
-        """
+    def __init__(
+        self,
+        display_offset=(0, 0),
+        *,
+        enabled: bool | None = None,
+        monitor_index: int = 1,
+        prefer_mss: bool = True,
+    ) -> None:
+        """Initialise the visual overlay and screenshot backend."""
+
+        self.window_name = "Visualiser"
         self.display_offset = display_offset
+        self.enabled = VISUALISER_ENABLED if enabled is None else enabled
+        self.monitor_index = monitor_index
+        self.prefer_mss = prefer_mss
         self.screenshot = None
-        self.visuals = {}
+        self.visuals: Dict[int, Dict[str, object]] = {}
         self.next_id = 1
         self.timer_end_time = None
         self.timer_color = None
-        self.status_console = StatusConsole()  # Add status console
-        self.screen_width = 1920  # Default values
+        self.status_console = StatusConsole()
+        self.screen_width = 1920
         self.screen_height = 1080
+        self._mss_monitor_index = max(1, monitor_index)
 
-        if not VISUALISER_ENABLED:
+        self.backend = self._select_backend()
+        self._configure_screen_dimensions()
+
+        if not self.enabled:
             return
 
-        # Create overlay window
-        cv2.namedWindow("Visualiser", cv2.WINDOW_NORMAL)
-        
-        # Set window to be transparent and click-through
-        if os.name == 'nt':  # Windows
-            import win32gui
-            import win32con
+        self._initialise_window()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+
+    def _select_backend(self) -> str:
+        if self.prefer_mss and mss is not None:
+            log.debug("Using MSS for screenshots")
+            return "mss"
+        if ImageGrab is not None:
+            log.debug("Using Pillow ImageGrab for screenshots")
+            return "pil"
+        if mss is not None:
+            log.debug("Falling back to MSS for screenshots")
+            return "mss"
+        raise RuntimeError("No screenshot backend available")
+
+    def _configure_screen_dimensions(self) -> None:
+        if self.backend == "pil" and ImageGrab is not None:
+            screen = ImageGrab.grab()
+            self.screen_width, self.screen_height = screen.size
+        elif self.backend == "mss" and mss is not None:
+            with mss.mss() as sct:
+                monitors = sct.monitors
+                index = self._resolve_monitor_index(monitors)
+                monitor = monitors[index]
+                self.screen_width = monitor["width"]
+                self.screen_height = monitor["height"]
+                self._mss_monitor_index = index
+        else:
+            self.screen_width, self.screen_height = 1920, 1080
+
+    def _resolve_monitor_index(self, monitors: List[Dict[str, int]]) -> int:
+        if not monitors:
+            return 1
+
+        desired = max(1, self.monitor_index)
+        max_index = max(1, len(monitors) - 1)
+        if desired > max_index:
+            log.warning(
+                "Requested monitor %s is unavailable, using monitor %s instead",
+                desired,
+                max_index,
+            )
+            return max_index
+        return desired
+
+    def _initialise_window(self) -> None:
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+
+        if os.name == "nt":
             import win32api
-            
-            # Get window handle
-            hwnd = win32gui.FindWindow(None, "Visualiser")
-            
-            # Set window to be layered and transparent (click-through)
+            import win32con
+            import win32gui
+
+            hwnd = win32gui.FindWindow(None, self.window_name)
             ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
             win32gui.SetWindowLong(
-                hwnd, 
-                win32con.GWL_EXSTYLE, 
-                ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+                hwnd,
+                win32con.GWL_EXSTYLE,
+                ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT,
             )
-            
-            # Set the window to be fully transparent
             win32gui.SetLayeredWindowAttributes(
                 hwnd,
-                win32api.RGB(0, 0, 0),  # Color key (black will be transparent)
-                255,  # Alpha (fully opaque)
-                win32con.LWA_COLORKEY  # Use color key for transparency
+                win32api.RGB(0, 0, 0),
+                255,
+                win32con.LWA_COLORKEY,
             )
-        
-        # Keep window on top
-        cv2.setWindowProperty("Visualiser", cv2.WND_PROP_TOPMOST, 1)
-        
-        # Get screen dimensions for the main monitor
-        screen = ImageGrab.grab()
-        self.screen_width, self.screen_height = screen.size
-        
-        # Position window on main monitor and make it fullscreen
-        cv2.moveWindow("Visualiser", 0, 0)
-        cv2.setWindowProperty("Visualiser", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+        cv2.setWindowProperty(self.window_name, cv2.WND_PROP_TOPMOST, 1)
+        cv2.moveWindow(self.window_name, self.display_offset[0], self.display_offset[1])
+        cv2.setWindowProperty(
+            self.window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+        )
 
     def take_screenshot(self):
-        """
-        Captures a screenshot of the primary monitor.
-        Temporarily hides visuals and status console to avoid capturing them.
-        """
-        if VISUALISER_ENABLED:
-            # Store current states and clear display
+        """Capture a screenshot using the configured backend."""
+
+        if self.enabled:
             current_visuals = self.visuals.copy()
             current_messages = self.status_console.messages.copy()
             current_progress_bars = self.status_console.progress_bars.copy()
-            
-            # Clear all visual elements
             self.visuals = {}
             self.status_console.messages = []
             self.status_console.progress_bars = {}
             self.render()
-            cv2.waitKey(1)  # Allow display to update
+            cv2.waitKey(1)
 
-        # Take the screenshot
-        screenshot = ImageGrab.grab()
-        self.screenshot = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-        
-        if VISUALISER_ENABLED:
-            # Restore states
+        if self.backend == "mss" and mss is not None:
+            with mss.mss() as sct:
+                monitors = sct.monitors
+                index = self._resolve_monitor_index(monitors)
+                monitor = monitors[index]
+                screenshot = np.array(sct.grab(monitor))
+                self.screen_width = monitor["width"]
+                self.screen_height = monitor["height"]
+            self.screenshot = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
+        elif self.backend == "pil" and ImageGrab is not None:
+            screenshot = ImageGrab.grab()
+            self.screen_width, self.screen_height = screenshot.size
+            self.screenshot = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+        else:  # pragma: no cover - no screenshot backend available
+            raise RuntimeError("No screenshot backend available")
+
+        if self.enabled:
             self.visuals = current_visuals
             self.status_console.messages = current_messages
             self.status_console.progress_bars = current_progress_bars
             self.render()
-        
+
         return self.screenshot
 
     def addVisuals(self, points, color, radius=5, point_type="target"):
@@ -108,7 +182,7 @@ class Visualiser:
         point_type: "target" (square), "action" (circle), "click" (cross)
         Returns a list of visual IDs.
         """
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return []
 
         if isinstance(points, tuple):
@@ -144,7 +218,7 @@ class Visualiser:
         line_type: "solid" or "dashed" for different line styles
         Returns the visual ID for the line
         """
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return -1
             
         vid = self.next_id
@@ -167,7 +241,7 @@ class Visualiser:
         Adds a drag path visualization with arrows.
         points: List of points forming the path
         """
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return []
             
         if len(points) < 2:
@@ -200,7 +274,7 @@ class Visualiser:
 
     def removeVisuals(self, visual_ids):
         """Removes overlays with the given visual IDs."""
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return
 
         for vid in visual_ids:
@@ -212,7 +286,7 @@ class Visualiser:
         """
         Redraws only the visuals on a transparent background with modern styling.
         """
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return
 
         # Create base image using screen dimensions if screenshot is None
@@ -378,6 +452,7 @@ class Visualiser:
         cv2.imshow("Visualiser", base_img)
         cv2.waitKey(1)
 
+
     def createTimer(self, seconds: int, color=GREEN) -> None:
         """
         Start a countdown timer.
@@ -386,7 +461,7 @@ class Visualiser:
             seconds (int): Number of seconds to count down from
             color (tuple): BGR color tuple for the timer text
         """
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return
 
         self.timer_end_time = time.time() + seconds
@@ -399,7 +474,7 @@ class Visualiser:
         Returns:
             bool: True if timer is still running, False if finished or no timer active
         """
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return False
 
         if self.timer_end_time is None:
@@ -418,7 +493,7 @@ class Visualiser:
         """
         Internal method to render the timer on screen with modern styling.
         """
-        if not VISUALISER_ENABLED:
+        if not self.enabled:
             return
 
         # Create transparent base image
@@ -544,6 +619,12 @@ class Visualiser:
             thickness,
             cv2.LINE_AA
         )
-        
+
         cv2.imshow("Visualiser", base_img)
-        cv2.waitKey(1) 
+        cv2.waitKey(1)
+
+    def close(self) -> None:
+        """Close the overlay window."""
+
+        if self.enabled:
+            cv2.destroyWindow(self.window_name)
