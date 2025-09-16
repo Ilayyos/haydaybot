@@ -15,6 +15,8 @@ An automated bot for HayDay farming that handles planting, harvesting, and selli
   ![Visual Feedback](https://i.imgur.com/hgwdCua.png)
 
 - **Configurable**: Easy to modify timing and detection parameters
+- **Dry Run Mode**: Validate detection logic without sending mouse or keyboard input
+- **Flexible CLI**: Override most runtime options via flags or a JSON config file
 
 ## Requirements
 
@@ -46,13 +48,46 @@ See `requirements.txt` for specific version requirements.
 
 ## Usage
 
-1. Start the bot:
+Run `python main.py --help` to see the available CLI options. A few useful examples:
 
-   ```
-   python main.py
-   ```
+```bash
+# Start with default settings
+python main.py
 
-2. Press the SPACE key at any time to stop the bot.
+# Disable mouse/keyboard output and dry-run the detection logic
+python main.py --dry-run
+
+# Capture a different monitor and disable the overlay
+python main.py --monitor 2 --no-visualiser
+```
+
+Press the **SPACE** key at any time to request a graceful shutdown.
+
+### Configuration file
+
+The bot can be configured via a JSON file passed with `--config`. Any CLI flag
+overrides the values defined in the file. A minimal example:
+
+```json
+{
+  "monitor_index": 1,
+  "display_offset": [-1920, 0],
+  "move_duration": 0.3,
+  "plant_wait_seconds": 120,
+  "max_retries": 4,
+  "dry_run": false,
+  "thresholds": {
+    "empty_slots": 0.82,
+    "grown_wheat": 0.78
+  }
+}
+```
+
+### Template preloading
+
+Passing `--prewarm` loads and caches all templates on startup which helps
+reduce disk I/O pauses during long sessions. Use `--no-prewarm` to explicitly
+skip the warm-up step.
 
 ## Project Structure
 
